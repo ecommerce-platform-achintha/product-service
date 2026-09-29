@@ -1,5 +1,6 @@
 package com.achintha.productservice.integration;
 
+import static com.achintha.productservice.security.GatewayUserHeaderFilter.USER_ID_HEADER;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -32,6 +33,9 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 @AutoConfigureMockMvc
 @Testcontainers
 class ProductFlowIntegrationTest {
+
+    /** Writes must carry the header the API Gateway sets after validating the JWT. */
+    private static final String GATEWAY_USER = "integration-test-user";
 
     @Container
     @ServiceConnection
@@ -104,14 +108,16 @@ class ProductFlowIntegrationTest {
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString(), "$.id");
 
-        mockMvc.perform(put("/api/products/{id}", id).contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(put("/api/products/{id}", id).header(USER_ID_HEADER, GATEWAY_USER)
+                        .contentType(MediaType.APPLICATION_JSON)
                         .content(productJson("Jigsaw Puzzle", "14.50", "TOY-001", games)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.name").value("Jigsaw Puzzle"))
                 .andExpect(jsonPath("$.price").value(14.5))
                 .andExpect(jsonPath("$.category.name").value("Games"));
 
-        mockMvc.perform(delete("/api/products/{id}", id)).andExpect(status().isNoContent());
+        mockMvc.perform(delete("/api/products/{id}", id).header(USER_ID_HEADER, GATEWAY_USER))
+                .andExpect(status().isNoContent());
         mockMvc.perform(get("/api/products/{id}", id)).andExpect(status().isNotFound());
         adjust(id, 1).andExpect(status().isNotFound());
     }
@@ -122,7 +128,8 @@ class ProductFlowIntegrationTest {
         createProduct("Hose", "20.00", "GARDEN-001", garden).andExpect(status().isCreated());
 
         // 400: validation
-        mockMvc.perform(post("/api/products").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/api/products").header(USER_ID_HEADER, GATEWAY_USER)
+                        .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"name":"","price":-1,"sku":"X"}
                                 """))
@@ -131,7 +138,7 @@ class ProductFlowIntegrationTest {
                 .andExpect(jsonPath("$.fieldErrors[?(@.field == 'name')]").exists())
                 .andExpect(jsonPath("$.fieldErrors[?(@.field == 'price')]").exists())
                 .andExpect(jsonPath("$.fieldErrors[?(@.field == 'categoryId')]").exists());
-        mockMvc.perform(patch("/api/products/{id}/inventory", UUID.randomUUID())
+        mockMvc.perform(patch("/api/products/{id}/inventory", UUID.randomUUID()).header(USER_ID_HEADER, GATEWAY_USER)
                         .contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.fieldErrors[0].field").value("delta"));
@@ -151,13 +158,15 @@ class ProductFlowIntegrationTest {
 
         // 409: duplicates
         createProduct("Another Hose", "21.00", "GARDEN-001", garden).andExpect(status().isConflict());
-        mockMvc.perform(post("/api/categories").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/api/categories").header(USER_ID_HEADER, GATEWAY_USER)
+                        .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Garden\"}"))
                 .andExpect(status().isConflict());
     }
 
     private String createCategory(String name) throws Exception {
-        String body = mockMvc.perform(post("/api/categories").contentType(MediaType.APPLICATION_JSON)
+        String body = mockMvc.perform(post("/api/categories").header(USER_ID_HEADER, GATEWAY_USER)
+                        .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"" + name + "\",\"description\":\"" + name + " items\"}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.name").value(name))
@@ -166,7 +175,8 @@ class ProductFlowIntegrationTest {
     }
 
     private ResultActions createProduct(String name, String price, String sku, String categoryId) throws Exception {
-        return mockMvc.perform(post("/api/products").contentType(MediaType.APPLICATION_JSON)
+        return mockMvc.perform(post("/api/products").header(USER_ID_HEADER, GATEWAY_USER)
+                .contentType(MediaType.APPLICATION_JSON)
                 .content(productJson(name, price, sku, categoryId)));
     }
 
@@ -177,7 +187,7 @@ class ProductFlowIntegrationTest {
     }
 
     private ResultActions adjust(String productId, int delta) throws Exception {
-        return mockMvc.perform(patch("/api/products/{id}/inventory", productId)
+        return mockMvc.perform(patch("/api/products/{id}/inventory", productId).header(USER_ID_HEADER, GATEWAY_USER)
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("{\"delta\":" + delta + "}"));
     }

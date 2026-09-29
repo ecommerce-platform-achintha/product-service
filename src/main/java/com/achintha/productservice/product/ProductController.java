@@ -26,7 +26,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
-// No auth here yet: access control will be enforced by the API Gateway.
+// Writes require the Gateway's X-User-Id header (see GatewayUserHeaderFilter); reads are public.
 @RestController
 @RequestMapping("/api/products")
 @RequiredArgsConstructor

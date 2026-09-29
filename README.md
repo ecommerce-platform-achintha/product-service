@@ -66,7 +66,26 @@ Stop with `docker compose down` (add `-v` to also delete the database volume).
 
 ## API
 
-No authentication yet. Access control will be enforced by the API Gateway.
+Reads (`GET`) are public. Writes (`POST`, `PUT`, `PATCH`, `DELETE`) must carry a non-blank `X-User-Id` header,
+which the API Gateway sets after it validates the caller's JWT. A write without it gets **401** with
+`{"error": "Authentication required"}` and is never processed.
+
+### Gateway bypass guard: what it does and does not protect
+
+> **This is not authentication.** `GatewayUserHeaderFilter` only checks that the `X-User-Id` header is
+> present. It does not validate a JWT or a signature, and it does not check the value. Anyone who can reach
+> this service directly can send `X-User-Id: anything` and the write goes through.
+
+The check only stops accidental or naive direct calls, such as a write that someone sends to port 8082
+by mistake instead of through the Gateway. The real protection comes from **network isolation** in
+deployment: only the API Gateway should be able to reach product-service (private network, no published port,
+firewall or security-group rules). The Gateway must also **strip any client-supplied `X-User-Id`** and set
+its own. Otherwise a client can put its own header on a request that goes through the Gateway.
+Until both are in place, do not treat write access to this service as secured.
+
+The guard matches on the HTTP method, not on a list of paths. Every request except `GET`, `HEAD` and
+`OPTIONS` needs the header, so new write endpoints are covered automatically. When you call writes directly
+(curl, Swagger UI), add the header yourself, as in the examples below.
 
 | Method | Path | Description |
 |---|---|---|
@@ -100,7 +119,7 @@ Response shape:
   "page": 0, "size": 20, "totalElements": 1, "totalPages": 1 }
 ```
 
-Errors always use the same JSON shape (400 validation, 404 not found, 409 conflict / insufficient stock):
+Errors other than the 401 above always use the same JSON shape (400 validation, 404 not found, 409 conflict / insufficient stock):
 
 ```json
 {
@@ -117,13 +136,19 @@ Validation errors also include `"fieldErrors": [{ "field": "price", "message": "
 ### Example curl session
 
 ```bash
+# Writes need the header the Gateway would set (see "Gateway bypass guard" above)
+AUTH=(-H 'X-User-Id: local-dev')
+
+# Without it, writes are rejected -> 401 {"error":"Authentication required"}
+curl -i -X POST http://localhost:8082/api/categories -H 'Content-Type: application/json' -d '{"name":"X"}'
+
 # Create a category -> 201
-CATEGORY_ID=$(curl -s -X POST http://localhost:8082/api/categories \
+CATEGORY_ID=$(curl -s -X POST http://localhost:8082/api/categories "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Electronics","description":"Gadgets and devices"}' | jq -r .id)
 
 # Create a product -> 201, stock starts at 0
-PRODUCT_ID=$(curl -s -X POST http://localhost:8082/api/products \
+PRODUCT_ID=$(curl -s -X POST http://localhost:8082/api/products "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Wireless Mouse\",\"description\":\"2.4GHz, USB-C\",\"price\":24.99,
        \"sku\":\"MOUSE-001\",\"categoryId\":\"$CATEGORY_ID\"}" | jq -r .id)
@@ -135,11 +160,11 @@ curl -s http://localhost:8082/api/products/$PRODUCT_ID
 curl -s "http://localhost:8082/api/products?categoryId=$CATEGORY_ID&minPrice=10&maxPrice=50&q=mouse&sort=price,asc&page=0&size=20"
 
 # Adjust inventory: restock 25 -> {"productId":"…","quantityAvailable":25,"reservedQuantity":0}
-curl -s -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory \
+curl -s -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory "${AUTH[@]}" \
   -H 'Content-Type: application/json' -d '{"delta":25}'
 
 # Take 30 out -> 409 Conflict, quantity stays 25
-curl -i -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory \
+curl -i -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory "${AUTH[@]}" \
   -H 'Content-Type: application/json' -d '{"delta":-30}'
 ```
 
@@ -168,6 +193,9 @@ mvn clean package
 - `ProductServiceTest`: rejects `minPrice > maxPrice` and unknown sort fields, and adds a stable sort tie-breaker
 - `InventoryTest`: the negative-quantity guard (a rejected change leaves stock untouched), overflow, and the
   service's 404 path
+- `GatewayUserHeaderFilterTest`: each write endpoint returns 401 with the JSON error and never reaches its
+  handler when `X-User-Id` is missing or blank, reaches the handler when the header is present, and the GET
+  endpoints work with or without the header (`@WebMvcTest` with mocked services, no database)
 - `ProductFlowIntegrationTest`: runs against a real PostgreSQL through Testcontainers (Docker required).
   It covers create product → list with a category filter (plus combined filters, sorting and paging) →
   adjust inventory → verify quantity, a 409 on negative stock, update and delete, and the 400/404/409 error bodies.
