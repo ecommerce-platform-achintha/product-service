@@ -1,0 +1,41 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: product-service
+  config:
+    # "optional:" lets the service start even when the Config Server is down.
+    # Override with CONFIG_SERVER_URL, e.g. inside Docker where localhost is the container.
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  datasource:
+    # Defaults match docker-compose.yml (productdb on host port 5433), so it can run next to user-service's DB.
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5433}/${DB_NAME:productdb}
+    username: ${DB_USERNAME:productservice}
+    password: ${DB_PASSWORD:productservice}
+  jpa:
+    # Temporary: schema managed by Hibernate until Flyway/Liquibase migrations are introduced.
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
