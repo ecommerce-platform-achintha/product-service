@@ -1,13 +1,15 @@
 package com.achintha.productservice.product;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import org.springframework.data.jpa.domain.Specification;
 
-/** Builds the product search query from whichever filters are present, instead of one query per combination. */
+/**
+ * Builds the merchant and admin product list queries from whichever filters are present, instead of one query per
+ * combination. (The public search is a separate engine, see {@code ProductSearchEngine}.)
+ */
 public final class ProductSpecifications {
 
     static final char LIKE_ESCAPE = '\\';
@@ -15,33 +17,25 @@ public final class ProductSpecifications {
     private ProductSpecifications() {
     }
 
-    public static Specification<Product> fromFilter(ProductFilter filter) {
+    /** The store's products: the store filter is always applied (ownership scoping). */
+    public static Specification<Product> forStore(UUID storeId, ProductStatus status, String q) {
         List<Specification<Product>> specs = new ArrayList<>();
-        if (filter.categoryId() != null) {
-            specs.add(inCategory(filter.categoryId()));
+        specs.add(inStore(storeId));
+        if (status != null) {
+            specs.add(hasStatus(status));
         }
-        if (filter.minPrice() != null) {
-            specs.add(priceAtLeast(filter.minPrice()));
-        }
-        if (filter.maxPrice() != null) {
-            specs.add(priceAtMost(filter.maxPrice()));
-        }
-        if (filter.q() != null && !filter.q().isBlank()) {
-            specs.add(nameContains(filter.q()));
+        if (q != null && !q.isBlank()) {
+            specs.add(nameContains(q));
         }
         return Specification.allOf(specs);
     }
 
-    static Specification<Product> inCategory(UUID categoryId) {
-        return (root, query, cb) -> cb.equal(root.get("category").get("id"), categoryId);
+    static Specification<Product> inStore(UUID storeId) {
+        return (root, query, cb) -> cb.equal(root.get("storeId"), storeId);
     }
 
-    static Specification<Product> priceAtLeast(BigDecimal minPrice) {
-        return (root, query, cb) -> cb.greaterThanOrEqualTo(root.get("price"), minPrice);
-    }
-
-    static Specification<Product> priceAtMost(BigDecimal maxPrice) {
-        return (root, query, cb) -> cb.lessThanOrEqualTo(root.get("price"), maxPrice);
+    static Specification<Product> hasStatus(ProductStatus status) {
+        return (root, query, cb) -> cb.equal(root.get("status"), status);
     }
 
     /** Case-insensitive partial match on the name. */
@@ -51,7 +45,7 @@ public final class ProductSpecifications {
     }
 
     /** Lower-cases and escapes LIKE wildcards so user input such as "50%" is matched literally. */
-    static String containsPattern(String text) {
+    public static String containsPattern(String text) {
         String escaped = text.trim().toLowerCase(Locale.ROOT)
                 .replace("\\", "\\\\")
                 .replace("%", "\\%")

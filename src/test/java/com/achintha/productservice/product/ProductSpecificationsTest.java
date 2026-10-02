@@ -1,122 +1,66 @@
 package com.achintha.productservice.product;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import jakarta.persistence.criteria.CriteriaBuilder;
-import jakarta.persistence.criteria.CriteriaQuery;
-import jakarta.persistence.criteria.Expression;
-import jakarta.persistence.criteria.Path;
-import jakarta.persistence.criteria.Predicate;
-import jakarta.persistence.criteria.Root;
-import java.math.BigDecimal;
-import java.util.UUID;
-import org.junit.jupiter.api.BeforeEach;
+import com.achintha.productservice.common.PublicIdGenerator;
+import com.achintha.productservice.common.TextSanitizer;
+import com.achintha.productservice.exception.ApiException;
+import com.achintha.productservice.search.SearchSort;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/** Checks which predicates are built for each filter combination, without a database. */
-@SuppressWarnings("unchecked")
+/** Pure helpers of the catalog: LIKE escaping, sort parsing, public ids, status transitions, text sanitising. */
 class ProductSpecificationsTest {
 
-    private final Root<Product> root = mock(Root.class);
-    private final CriteriaQuery<?> query = mock(CriteriaQuery.class);
-    private final CriteriaBuilder cb = mock(CriteriaBuilder.class);
-
-    private final Path<Object> categoryPath = mock(Path.class);
-    private final Path<Object> categoryIdPath = mock(Path.class);
-    private final Path<BigDecimal> pricePath = mock(Path.class);
-    private final Path<String> namePath = mock(Path.class);
-    private final Expression<String> lowerName = mock(Expression.class);
-
-    private final Predicate categoryPredicate = mock(Predicate.class);
-    private final Predicate minPricePredicate = mock(Predicate.class);
-    private final Predicate maxPricePredicate = mock(Predicate.class);
-    private final Predicate namePredicate = mock(Predicate.class);
-
-    private final UUID categoryId = UUID.randomUUID();
-    private final BigDecimal min = new BigDecimal("10.00");
-    private final BigDecimal max = new BigDecimal("99.99");
-
-    @BeforeEach
-    void setUp() {
-        doReturn(categoryPath).when(root).get("category");
-        doReturn(categoryIdPath).when(categoryPath).get("id");
-        doReturn(pricePath).when(root).get("price");
-        doReturn(namePath).when(root).get("name");
-        when(cb.lower(namePath)).thenReturn(lowerName);
-
-        when(cb.equal(categoryIdPath, categoryId)).thenReturn(categoryPredicate);
-        when(cb.greaterThanOrEqualTo(pricePath, min)).thenReturn(minPricePredicate);
-        when(cb.lessThanOrEqualTo(pricePath, max)).thenReturn(maxPricePredicate);
-        when(cb.like(any(Expression.class), any(String.class), any(Character.class))).thenReturn(namePredicate);
-        when(cb.and(any(Expression.class), any(Expression.class))).thenAnswer(inv -> mock(Predicate.class));
+    @Test
+    void likeWildcardsAreEscaped() {
+        assertThat(ProductSpecifications.containsPattern("  50% OFF_now\\ ")).isEqualTo("%50\\% off\\_now\\\\%");
     }
 
-    private Predicate predicateFor(ProductFilter filter) {
-        return ProductSpecifications.fromFilter(filter).toPredicate(root, query, cb);
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {"relevance|RELEVANCE", "price|PRICE_ASC", "price,asc|PRICE_ASC",
+            "PRICE,DESC|PRICE_DESC", "newest|NEWEST", "rating|RATING"})
+    void whitelistedSortsAreParsed(String sort, SearchSort expected) {
+        assertThat(SearchSort.parse(sort)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"name", "price,up", "newest,asc", "rating,desc,x", "id"})
+    void otherSortsAreRejected(String sort) {
+        assertThatThrownBy(() -> SearchSort.parse(sort)).isInstanceOf(ApiException.class)
+                .hasMessageContaining("sort must be one of");
     }
 
     @Test
-    void noFiltersMeansNoRestriction() {
-        assertThat(predicateFor(ProductFilter.none())).isNull();
-        verifyNoInteractions(cb);
+    void publicIdsUseThePrefixMonthAndCrockfordSuffix() {
+        PublicIdGenerator generator = new PublicIdGenerator(
+                Clock.fixed(Instant.parse("2026-10-15T00:00:00Z"), ZoneOffset.UTC));
+        String id = generator.generate(PublicIdGenerator.ITEM_PREFIX);
+        assertThat(id).startsWith("ITM-2610-");
+        assertThat(PublicIdGenerator.isValid(id)).isTrue();
+        assertThat(id.substring(9)).doesNotContain("I", "L", "O", "U");
     }
 
     @Test
-    void blankSearchTextIsIgnored() {
-        assertThat(predicateFor(new ProductFilter(null, null, null, "   "))).isNull();
-        verifyNoInteractions(cb);
+    void statusTransitions() {
+        assertThat(ProductStatus.DRAFT.canMoveTo(ProductStatus.ACTIVE)).isTrue();
+        assertThat(ProductStatus.ACTIVE.canMoveTo(ProductStatus.DRAFT)).isTrue();
+        assertThat(ProductStatus.ACTIVE.canMoveTo(ProductStatus.ARCHIVED)).isTrue();
+        assertThat(ProductStatus.ARCHIVED.canMoveTo(ProductStatus.DRAFT)).isTrue();
+        assertThat(ProductStatus.ARCHIVED.canMoveTo(ProductStatus.ACTIVE)).isFalse();
     }
 
     @Test
-    void categoryOnlyFiltersOnCategoryId() {
-        assertThat(predicateFor(new ProductFilter(categoryId, null, null, null))).isSameAs(categoryPredicate);
-        verify(cb).equal(categoryIdPath, categoryId);
-        verify(cb, never()).and(any(Expression.class), any(Expression.class));
-    }
-
-    @Test
-    void minPriceOnlyIsInclusiveLowerBound() {
-        assertThat(predicateFor(new ProductFilter(null, min, null, null))).isSameAs(minPricePredicate);
-        verify(cb, never()).lessThanOrEqualTo(any(Expression.class), any(BigDecimal.class));
-    }
-
-    @Test
-    void maxPriceOnlyIsInclusiveUpperBound() {
-        assertThat(predicateFor(new ProductFilter(null, null, max, null))).isSameAs(maxPricePredicate);
-        verify(cb, never()).greaterThanOrEqualTo(any(Expression.class), any(BigDecimal.class));
-    }
-
-    @Test
-    void searchTextIsCaseInsensitivePartialMatchOnName() {
-        assertThat(predicateFor(new ProductFilter(null, null, null, "  LapTop "))).isSameAs(namePredicate);
-        verify(cb).lower(namePath);
-        verify(cb).like(lowerName, "%laptop%", '\\');
-    }
-
-    @Test
-    void allFiltersAreCombinedWithAnd() {
-        Predicate result = predicateFor(new ProductFilter(categoryId, min, max, "phone"));
-
-        assertThat(result).isNotNull();
-        verify(cb).equal(categoryIdPath, categoryId);
-        verify(cb).greaterThanOrEqualTo(pricePath, min);
-        verify(cb).lessThanOrEqualTo(pricePath, max);
-        verify(cb).like(lowerName, "%phone%", '\\');
-        // four predicates -> three ANDs
-        verify(cb, times(3)).and(any(Expression.class), any(Expression.class));
-    }
-
-    @Test
-    void likeWildcardsInSearchTextAreEscaped() {
-        assertThat(ProductSpecifications.containsPattern("50%_off\\"))
-                .isEqualTo("%50\\%\\_off\\\\%");
+    void freeTextIsSanitised() {
+        assertThat(TextSanitizer.clean("Nice <b>bold</b> & <img src=x onerror=alert(1)>cheap"))
+                .isEqualTo("Nice bold & cheap");
+        assertThat(TextSanitizer.cleanLine("  two\n lines ")).isEqualTo("two lines");
+        assertThat(TextSanitizer.clean("   ")).isNull();
     }
 }

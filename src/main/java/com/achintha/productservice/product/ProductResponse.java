@@ -1,33 +1,64 @@
 package com.achintha.productservice.product;
 
 import com.achintha.productservice.category.CategoryResponse;
-import com.achintha.productservice.inventory.Inventory;
+import com.achintha.productservice.discount.DiscountDtos.AppliedDiscount;
+import com.achintha.productservice.inventory.InventoryResponse;
 import java.math.BigDecimal;
 import java.time.Instant;
-import java.util.UUID;
+import java.util.List;
+import java.util.Map;
 
+/**
+ * The full product aggregate as its merchant (or an admin) sees it: every variant with stock and the price after
+ * the discount that applies right now. No store visibility here, so a store in its silent ban grace period looks
+ * unchanged to its merchant (D4).
+ */
 public record ProductResponse(
-        UUID id,
+        String publicId,
         String name,
         String description,
-        BigDecimal price,
-        String sku,
-        CategoryResponse category,
-        Stock stock,
+        CategoryResponse.Ref category,
+        ProductStatus status,
+        boolean codAllowed,
+        List<String> imageKeys,
+        List<String> imageUrls,
+        List<OptionResponse> options,
+        List<VariantResponse> variants,
+        BigDecimal ratingAvg,
+        int ratingCount,
         Instant createdAt,
-        Instant updatedAt) {
+        Instant updatedAt,
+        long version) {
 
-    public record Stock(int quantityAvailable, int reservedQuantity) {
-
-        static Stock from(Inventory inventory) {
-            return inventory == null ? new Stock(0, 0)
-                    : new Stock(inventory.getQuantityAvailable(), inventory.getReservedQuantity());
-        }
+    public record OptionResponse(String name, List<String> values) {
     }
 
-    public static ProductResponse from(Product product, Inventory inventory) {
-        return new ProductResponse(product.getId(), product.getName(), product.getDescription(), product.getPrice(),
-                product.getSku(), CategoryResponse.from(product.getCategory()), Stock.from(inventory),
-                product.getCreatedAt(), product.getUpdatedAt());
+    public record VariantResponse(
+            String publicId,
+            String sku,
+            Map<String, String> attributes,
+            String label,
+            BigDecimal listPrice,
+            BigDecimal effectivePrice,
+            AppliedDiscount discount,
+            VariantStatus status,
+            List<String> imageKeys,
+            InventoryResponse stock) {
+    }
+
+    /** One row of the merchant / admin product lists. */
+    public record Summary(
+            String publicId,
+            String name,
+            CategoryResponse.Ref category,
+            ProductStatus status,
+            int variantCount,
+            int activeVariantCount,
+            BigDecimal minListPrice,
+            int totalAvailable,
+            int totalReserved,
+            BigDecimal ratingAvg,
+            int ratingCount,
+            Instant updatedAt) {
     }
 }

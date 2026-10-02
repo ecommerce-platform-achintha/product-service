@@ -1,7 +1,7 @@
 # Runs product-service + its PostgreSQL database.
 #
-# Config Server (8888) and Eureka (8761) are expected to be running on the host
-# (see README); the container reaches them via host.docker.internal.
+# Config Server (8888), Eureka (8761), user-service (8081, JWKS + service tokens) and Kafka (9092) are expected to
+# be running on the host (see README); the container reaches them via host.docker.internal.
 #
 # The database is published on host port 5433 (user-service's uses 5432), so both
 # stacks can run at the same time.
@@ -46,6 +46,11 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-productservice}
       CONFIG_SERVER_URL: ${CONFIG_SERVER_URL:-http://host.docker.internal:8888}
       EUREKA_URL: ${EUREKA_URL:-http://host.docker.internal:8761/eureka/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-host.docker.internal:9092}
+      JWKS_URI: ${JWKS_URI:-http://host.docker.internal:8081/.well-known/jwks.json}
+      # Secret, same value as in user-service; required outside the "local" profile (no default here)
+      SERVICE_CLIENT_SECRET_PRODUCT: ${SERVICE_CLIENT_SECRET_PRODUCT:-}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-local}
       # Register as localhost:8082 (the published port) rather than the container's internal IP
       EUREKA_INSTANCE_PREFER_IP_ADDRESS: "false"
       EUREKA_INSTANCE_HOSTNAME: localhost

@@ -1,22 +1,22 @@
 package com.achintha.productservice.product;
 
 import com.achintha.productservice.common.PageResponse;
-import com.achintha.productservice.inventory.AdjustInventoryRequest;
-import com.achintha.productservice.inventory.InventoryResponse;
-import com.achintha.productservice.inventory.InventoryService;
+import com.achintha.productservice.common.Pagination;
+import com.achintha.productservice.config.OpenApiConfig;
+import com.achintha.productservice.product.ProductRequest.StatusRequest;
+import com.achintha.productservice.security.Actor;
 import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
-import java.math.BigDecimal;
-import java.util.UUID;
+import java.util.Map;
 import lombok.RequiredArgsConstructor;
-import org.springdoc.core.annotations.ParameterObject;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.web.PageableDefault;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -26,54 +26,75 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
-// Writes require the Gateway's X-User-Id header (see GatewayUserHeaderFilter); reads are public.
+/**
+ * The caller's store catalog: the merchant, or an assistant with {@code PRODUCT_EDIT} (reads also with
+ * {@code STOCK_EDIT} or {@code DISCOUNT_MANAGE}, which need to see the products they work on).
+ */
 @RestController
-@RequestMapping("/api/products")
+@RequestMapping("/api/merchant/products")
+@SecurityRequirement(name = OpenApiConfig.BEARER_AUTH)
 @RequiredArgsConstructor
+@Tag(name = "Merchant: products")
 public class ProductController {
 
+    static final String READ = "hasAnyAuthority('PERM_PRODUCT_EDIT','PERM_STOCK_EDIT','PERM_DISCOUNT_MANAGE')";
+    static final String EDIT = "hasAuthority('PERM_PRODUCT_EDIT')";
+    static final Map<String, String> SORTABLE = Map.of("createdAt", "createdAt", "updatedAt", "updatedAt",
+            "name", "name");
+
     private final ProductService productService;
-    private final InventoryService inventoryService;
+
+    @GetMapping
+    @PreAuthorize(READ)
+    @Operation(summary = "The store's products (any status), optionally filtered by status and name")
+    public PageResponse<ProductResponse.Summary> list(@AuthenticationPrincipal Jwt jwt,
+                                                      @RequestParam(required = false) ProductStatus status,
+                                                      @RequestParam(required = false) String q,
+                                                      @RequestParam(defaultValue = "0") int page,
+                                                      @RequestParam(defaultValue = "20") int size,
+                                                      @RequestParam(defaultValue = "updatedAt,desc") String sort) {
+        return productService.list(Actor.from(jwt), status, q,
+                Pagination.of(page, size, sort, SORTABLE, Pagination.MAX_SIZE));
+    }
+
+    @GetMapping("/{publicId}")
+    @PreAuthorize(READ)
+    @Operation(summary = "One product with options, variants, stock and current prices")
+    public ProductResponse get(@AuthenticationPrincipal Jwt jwt, @PathVariable String publicId) {
+        return productService.get(Actor.from(jwt), publicId);
+    }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    @Operation(summary = "Create a product; its inventory starts at 0")
-    public ProductResponse create(@Valid @RequestBody ProductRequest request) {
-        return productService.create(request);
+    @PreAuthorize(EDIT)
+    @Operation(summary = "Create a product (DRAFT) with its options and variants; a simple product (sku + listPrice) "
+            + "gets a default variant")
+    public ProductResponse create(@AuthenticationPrincipal Jwt jwt, @Valid @RequestBody ProductRequest request) {
+        return productService.create(Actor.from(jwt), request);
     }
 
-    @GetMapping("/{id}")
-    public ProductResponse get(@PathVariable UUID id) {
-        return productService.get(id);
+    @PutMapping("/{publicId}")
+    @PreAuthorize(EDIT)
+    @Operation(summary = "Replace the product aggregate; listed variants are updated (publicId) or added, the "
+            + "others become INACTIVE")
+    public ProductResponse update(@AuthenticationPrincipal Jwt jwt, @PathVariable String publicId,
+                                  @Valid @RequestBody ProductRequest request) {
+        return productService.update(Actor.from(jwt), publicId, request);
     }
 
-    @PutMapping("/{id}")
-    public ProductResponse update(@PathVariable UUID id, @Valid @RequestBody ProductRequest request) {
-        return productService.update(id, request);
+    @PostMapping("/{publicId}/status")
+    @PreAuthorize(EDIT)
+    @Operation(summary = "Change the status: DRAFT <-> ACTIVE (needs an active variant and an approved merchant), "
+            + "-> ARCHIVED, ARCHIVED -> DRAFT")
+    public ProductResponse changeStatus(@AuthenticationPrincipal Jwt jwt, @PathVariable String publicId,
+                                        @Valid @RequestBody StatusRequest request) {
+        return productService.changeStatus(Actor.from(jwt), publicId, request.status());
     }
 
-    @DeleteMapping("/{id}")
-    @ResponseStatus(HttpStatus.NO_CONTENT)
-    public void delete(@PathVariable UUID id) {
-        productService.delete(id);
-    }
-
-    @GetMapping
-    @Operation(summary = "Search products; all filters are optional and combine with AND")
-    public PageResponse<ProductResponse> list(
-            @RequestParam(required = false) UUID categoryId,
-            @RequestParam(required = false) BigDecimal minPrice,
-            @RequestParam(required = false) BigDecimal maxPrice,
-            @Parameter(description = "Case-insensitive partial match on the name")
-            @RequestParam(required = false) String q,
-            @ParameterObject @PageableDefault(size = 20, sort = "name") Pageable pageable) {
-        return productService.search(new ProductFilter(categoryId, minPrice, maxPrice, q), pageable);
-    }
-
-    @PatchMapping("/{id}/inventory")
-    @Operation(summary = "Add delta to the available quantity; 409 if the result would be negative")
-    public InventoryResponse adjustInventory(@PathVariable UUID id,
-                                             @Valid @RequestBody AdjustInventoryRequest request) {
-        return inventoryService.adjust(id, request.delta());
+    @DeleteMapping("/{publicId}")
+    @PreAuthorize(EDIT)
+    @Operation(summary = "Archive the product (products are never deleted)")
+    public ProductResponse archive(@AuthenticationPrincipal Jwt jwt, @PathVariable String publicId) {
+        return productService.changeStatus(Actor.from(jwt), publicId, ProductStatus.ARCHIVED);
     }
 }

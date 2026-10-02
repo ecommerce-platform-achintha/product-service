@@ -7,21 +7,134 @@ spring:
   config:
     # "optional:" lets the service start even when the Config Server is down.
     # Override with CONFIG_SERVER_URL, e.g. inside Docker where localhost is the container.
+    # The service client secret comes from the Config Server or the environment; there is no local default for it.
     import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
   datasource:
-    # Defaults match docker-compose.yml (productdb on host port 5433), so it can run next to user-service's DB.
+    # Defaults match docker-compose.yml (productdb on host port 5433), next to user-service (5432),
+    # order-service (5434) and store-service (5435).
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5433}/${DB_NAME:productdb}
     username: ${DB_USERNAME:productservice}
     password: ${DB_PASSWORD:productservice}
   jpa:
-    # Temporary: schema managed by Hibernate until Flyway/Liquibase migrations are introduced.
+    # Schema is owned by Flyway (src/main/resources/db/migration); Hibernate only checks it matches the entities.
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
-  data:
-    web:
-      pageable:
-        max-page-size: 100
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # The outbox relay sends the stored JSON payload as-is, keyed by the aggregate's UUID
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+    consumer:
+      # Payloads are plain JSON with an "eventType" field; parsed by the listeners themselves
+      group-id: product-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  cloud:
+    openfeign:
+      client:
+        config:
+          user-service:
+            connect-timeout: 1000
+            # Backstop only: the 3s TimeLimiter below normally fires first
+            read-timeout: 4000
+
+# Local fallbacks mirroring config-repo (application.yml + product-service.yml). The Config Server wins when reachable.
+security:
+  jwt:
+    issuer: ${JWT_ISSUER:user-service}
+    audience: ${JWT_AUDIENCE:marketplace}
+    jwks-uri: ${JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    clock-skew-seconds: ${JWT_CLOCK_SKEW_SECONDS:30}
+  internal:
+    # Client credentials for user-service's POST /internal/auth/service-token. The secret comes from the Config
+    # Server (SERVICE_CLIENT_SECRET_PRODUCT, same value as in user-service); no default on purpose.
+    client-id: ${spring.application.name}
+    client-secret: ${SERVICE_CLIENT_SECRET_PRODUCT:}
+    # A cached service token is renewed this long before it expires
+    refresh-before-expiry: PT30S
+  state-cache:
+    # Token-version cache of the SecurityStateFilter (fed by user-events, filled from user-service on a miss)
+    max-size: 100000
+    ttl: PT10M
+
+app:
+  timezone: ${APP_TIMEZONE:Asia/Colombo}
+  kafka:
+    topics:
+      user-events: ${KAFKA_TOPIC_USER_EVENTS:user-events}
+      store-events: ${KAFKA_TOPIC_STORE_EVENTS:store-events}
+      product-events: ${KAFKA_TOPIC_PRODUCT_EVENTS:product-events}
+      order-events: ${KAFKA_TOPIC_ORDER_EVENTS:order-events}
+  scheduling:
+    # Turns all @Scheduled jobs off (tests trigger the jobs directly)
+    enabled: true
+    shedlock:
+      enabled: ${SHEDLOCK_ENABLED:true}
+      default-lock-at-most-for: PT10M
+    # Safety net: release HELD reservations still held "grace" after their expiresAt (order-service is authoritative)
+    reservation-cleanup:
+      interval: PT5M
+      grace: PT1H
+      batch-size: 200
+  outbox:
+    relay-interval: PT1S
+    batch-size: 100
+  search:
+    # Product search implementation: "sql" (PostgreSQL ILIKE + trigram ranking). A search engine can replace it.
+    engine: sql
+  catalog:
+    # A variant with at most this many units left is flagged lowStock on the public detail page
+    low-stock-threshold: 5
+    max-variants-per-product: 100
+  ports:
+    # Mock adapters for the external providers (log only, always succeed). Set to another value once a real
+    # adapter exists.
+    notification: mock
+    image-storage: mock
+    image-base-url: https://images.example.invalid/
+
+# Resilience for calls to user-service (see UserServiceGateway). Each call runs as
+# Retry(CircuitBreaker(TimeLimiter(feign call))), like order-service's product-service calls.
+resilience4j:
+  circuitbreaker:
+    instances:
+      userService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 100
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        # user-service answered, just "no": not a sign it is unhealthy
+        ignore-exceptions:
+          - com.achintha.productservice.exception.NotFoundException
+  retry:
+    instances:
+      userService:
+        max-attempts: 2
+        wait-duration: 300ms
+        ignore-exceptions:
+          - com.achintha.productservice.exception.NotFoundException
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+  timelimiter:
+    instances:
+      userService:
+        timeout-duration: 3s
+        cancel-running-future: true
 
 eureka:
   client:
@@ -35,7 +148,12 @@ management:
     web:
       exposure:
         include: health,info
+  endpoint:
+    health:
+      show-details: never
 
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
+  # Internal (service-to-service) endpoints are never part of the public API docs
+  paths-to-exclude: /internal/**

@@ -1,24 +1,27 @@
 package com.achintha.productservice.inventory;
 
-import com.achintha.productservice.exception.BadRequestException;
-import com.achintha.productservice.exception.InsufficientStockException;
-import com.achintha.productservice.product.Product;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.Id;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
+import java.time.Instant;
 import java.util.UUID;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 /**
- * Stock for one product, kept in its own table: stock changes far more often than product details, so this keeps
- * that write traffic (and its row locks) away from the products table.
+ * Stock of one variant, in its own table: stock changes far more often than catalog data, so this keeps that write
+ * traffic (and its row locks) away from the products and variants tables.
+ *
+ * <ul>
+ *   <li>{@code quantityAvailable}: units that can still be sold (held units are not included);</li>
+ *   <li>{@code reservedQuantity}: units held for orders that are not committed yet.</li>
+ * </ul>
+ *
+ * Changed only by the merchant stock edit (optimistic locking with {@code @Version}) and by the reservation API
+ * (conditional updates that also bump the version, see {@link InventoryRepository}).
  */
 @Entity
 @Table(name = "inventory")
@@ -28,12 +31,8 @@ import lombok.Setter;
 public class Inventory {
 
     @Id
-    @GeneratedValue
-    private UUID id;
-
-    @OneToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "product_id", nullable = false, unique = true)
-    private Product product;
+    @Column(name = "variant_id")
+    private UUID variantId;
 
     @Column(name = "quantity_available", nullable = false)
     private int quantityAvailable;
@@ -41,22 +40,15 @@ public class Inventory {
     @Column(name = "reserved_quantity", nullable = false)
     private int reservedQuantity;
 
-    public Inventory(Product product) {
-        this.product = product;
-    }
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
 
-    /**
-     * Applies a stock change (negative to decrement). Rejects changes that would leave a negative quantity, leaving
-     * the current quantity untouched.
-     */
-    public void adjust(int delta) {
-        long result = (long) quantityAvailable + delta;
-        if (result < 0) {
-            throw new InsufficientStockException(product.getId(), quantityAvailable, delta);
-        }
-        if (result > Integer.MAX_VALUE) {
-            throw new BadRequestException("Adjustment would exceed the maximum stock quantity");
-        }
-        quantityAvailable = (int) result;
+    @Version
+    private long version;
+
+    public Inventory(UUID variantId, int quantityAvailable, Instant now) {
+        this.variantId = variantId;
+        this.quantityAvailable = quantityAvailable;
+        this.updatedAt = now;
     }
 }

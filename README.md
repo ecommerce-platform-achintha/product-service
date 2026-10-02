@@ -1,201 +1,287 @@
 # product-service
 
-Spring Boot microservice for the product catalog: categories, products, and product stock (inventory).
+The marketplace catalog: admin-managed categories, merchant-owned products (items) with variants, stock with
+reservations for orders, discounts, public search and product reviews. The contract is
+[`docs/marketplace-design.md`](docs/marketplace-design.md) (sections 1, 3, 5, 9, 10 and 11 apply here).
 
 - Java 25, Spring Boot 4.1.1, Spring Cloud 2025.1.3, Maven
-- PostgreSQL via Spring Data JPA (`ddl-auto=update` for now; Flyway/Liquibase to follow)
-- Config from the Config Server (`optional:configserver:http://localhost:8888`)
-- Registers with Eureka (`http://localhost:8761/eureka/`)
+- PostgreSQL, schema managed by **Flyway** (`src/main/resources/db/migration`), `ddl-auto=validate`
+- Kafka: publishes `product-events` through a transactional outbox; consumes `user-events`, `store-events` and
+  `order-events`
+- JWTs validated against user-service's JWKS (RS256, issuer, audience, 30 s skew); deny-by-default security
+- Config from the Config Server (`optional:configserver:http://localhost:8888`), registers with Eureka
 - Port **8082**
 
 ## Prerequisites
 
-Start these **before** product-service:
-
 | Dependency | Default location | Notes |
 |---|---|---|
-| Config Server | `http://localhost:8888` | `../config-server`. Optional: the service starts without it |
-| Eureka (service-registry) | `http://localhost:8761` | `../service-registry` |
-| PostgreSQL | `localhost:5433`, db `productdb`, user/pass `productservice`/`productservice` | `docker compose up -d postgres` starts one with these defaults |
+| Config Server | `http://localhost:8888` | `../config-server`, serves `config-repo/product-service.yml` |
+| Eureka (service-registry) | `http://localhost:8761` | `../service-registry`; user-service is called through it (`lb://user-service`) |
+| user-service | `http://localhost:8081` | JWKS (`/.well-known/jwks.json`), service tokens and security state |
+| PostgreSQL | `localhost:5433`, db `productdb`, user/pass `productservice` | `docker compose up -d postgres` |
+| Kafka | `localhost:9092` | the shared broker from `../order-service`. Optional: without it, events wait in the `outbox` table |
 
-The database is on port **5433** with its own name and volume, so it can run next to user-service's
-PostgreSQL on 5432.
+JDK 25, Maven 3.9+ and Docker (docker-compose, Testcontainers) are needed too.
 
-You also need JDK 25, Maven 3.9+, and Docker (for docker-compose and the Testcontainers integration test).
+The schema is a fresh Flyway baseline (`V1__init.sql`). Drop an old dev database once before the first start:
+`docker compose down -v`.
 
 ## Configuration
-
-Every setting can be overridden with an environment variable:
 
 | Env var | Default | Purpose |
 |---|---|---|
 | `DB_HOST` / `DB_PORT` / `DB_NAME` | `localhost` / `5433` / `productdb` | JDBC URL parts |
-| `DB_USERNAME` / `DB_PASSWORD` | `productservice` / `productservice` | DB credentials |
+| `DB_USERNAME` / `DB_PASSWORD` | `productservice` / `productservice` | DB credentials (set `DB_PASSWORD` outside local) |
 | `CONFIG_SERVER_URL` | `http://localhost:8888` | Config Server |
 | `EUREKA_URL` | `http://localhost:8761/eureka/` | Eureka `defaultZone` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka (outbox relay and consumers) |
+| `KAFKA_TOPIC_USER_EVENTS` / `_STORE_EVENTS` / `_PRODUCT_EVENTS` / `_ORDER_EVENTS` | `user-events` / `store-events` / `product-events` / `order-events` | topic names |
+| `JWKS_URI` | `http://localhost:8081/.well-known/jwks.json` | user-service public keys |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | `user-service` / `marketplace` | expected `iss` / `aud` |
+| `JWT_CLOCK_SKEW_SECONDS` | `30` | `exp`/`nbf` tolerance |
+| `SERVICE_CLIENT_SECRET_PRODUCT` | `local` profile: dev placeholder from the Config Server; otherwise **required** (secret) | client secret for user-service's `POST /internal/auth/service-token` (same value as in user-service) |
+| `SHEDLOCK_ENABLED` | `true` | scheduler locks (one replica runs the outbox relay and the reservation safety net at a time) |
+| `APP_TIMEZONE` | `Asia/Colombo` | display |
+
+Other settings (Config Server or `application.yml`): `app.outbox.relay-interval` (PT1S) / `.batch-size` (100),
+`app.scheduling.reservation-cleanup.interval` (PT5M) / `.grace` (PT1H) / `.batch-size` (200),
+`app.search.engine` (`sql`), `app.catalog.low-stock-threshold` (5) / `.max-variants-per-product` (100),
+`security.state-cache.max-size` (100000) / `.ttl` (PT10M), `security.internal.refresh-before-expiry` (PT30S),
+`resilience4j.*.userService`, `app.ports.notification` / `app.ports.image-storage` (`mock`),
+`app.ports.image-base-url`.
+
+The service refuses to start outside the `local` profile when the service client secret is blank or still the
+`LOCAL-DEV-ONLY` placeholder.
 
 ## Run locally
 
 ```bash
-# 1. Config Server and Eureka (in their own terminals)
-(cd ../config-server   && mvn spring-boot:run)
-(cd ../service-registry && mvn spring-boot:run)
-
-# 2. PostgreSQL only
-docker compose up -d postgres
-
-# 3. product-service
-mvn spring-boot:run
+(cd ../config-server && mvn spring-boot:run)          # own terminal
+(cd ../service-registry && mvn spring-boot:run)       # own terminal
+(cd ../user-service && SPRING_PROFILES_ACTIVE=local mvn spring-boot:run)   # JWKS + internal endpoints
+docker compose up -d postgres                         # PostgreSQL on 5433
+SPRING_PROFILES_ACTIVE=local mvn spring-boot:run
 ```
 
-Swagger UI: http://localhost:8082/swagger-ui.html
-Health check: http://localhost:8082/actuator/health
+Swagger UI: http://localhost:8082/swagger-ui.html (use **Authorize** with an access token from user-service).
+Health: http://localhost:8082/actuator/health. Only `health` and `info` are exposed. `/internal/**` is not in the
+API document.
 
-## Run with docker-compose
+## Docker
 
-This starts product-service and its PostgreSQL with one command. Config Server and Eureka must
-still be running on the host. The container reaches them through `host.docker.internal`.
+`docker compose up --build` runs the service and its PostgreSQL; Config Server, Eureka, user-service and Kafka are
+reached on the host through `host.docker.internal` (override `CONFIG_SERVER_URL`, `EUREKA_URL`, `JWKS_URI`,
+`KAFKA_BOOTSTRAP_SERVERS`). Outside the `local` profile, also set `SERVICE_CLIENT_SECRET_PRODUCT`. The
+`Dockerfile` is multi-stage and runs as a non-root user.
 
-```bash
-docker compose up --build
-```
+## Security
 
-To point the container elsewhere, override `CONFIG_SERVER_URL` / `EUREKA_URL`
-(e.g. `CONFIG_SERVER_URL=http://config-server:8888 docker compose up`).
-Stop with `docker compose down` (add `-v` to also delete the database volume).
+- Every request with a bearer token is validated against user-service's JWKS: RS256 only, `iss`, `aud`,
+  `exp`/`nbf` with 30 s skew, a subject and a known `role`. Identity always comes from the token (`sub`,
+  `storeId`, `perms`, `status`). The old `GatewayUserHeaderFilter` (`X-User-Id`) is gone: headers are never
+  trusted.
+- **SecurityStateFilter** rejects revoked tokens with 401 `TOKEN_REVOKED`: a Caffeine cache (user id → token
+  version and real status) is fed by `user-events` (`UserSecurityChanged`, `UserStatusChanged`); on a miss, or when
+  a token is newer than the cache, it asks user-service `GET /internal/users/{id}/security-state` with a service
+  token (**ServiceTokenProvider**, client credentials, cached until 30 s before expiry; Feign + Resilience4j retry,
+  circuit breaker, 3 s time limit). If user-service cannot be reached the token is accepted (staleness bounded by
+  the 10-minute token lifetime).
+- Prefix rules (section 3.4), deny-by-default, repeated with `@PreAuthorize` on every controller method:
 
-## API
+| Prefix | Who |
+|---|---|
+| `/api/public/**` (GET) | anyone |
+| `/api/customer/**` | `ROLE_CUSTOMER` |
+| `/api/merchant/**` | `ROLE_MERCHANT` (holds every permission), or `ROLE_ASSISTANT` with the route's permission: `PRODUCT_EDIT` (products), `STOCK_EDIT` (stock), `DISCOUNT_MANAGE` (discounts), `REVIEW_REPLY` (review replies). Product reads accept any of `PRODUCT_EDIT`, `STOCK_EDIT`, `DISCOUNT_MANAGE` |
+| `/api/admin/**` | `ROLE_ADMIN`, `ROLE_SUPER_ADMIN` |
+| `/internal/**` | `ROLE_SERVICE` (never routed by the gateway, not in the OpenAPI document) |
+| anything else | denied (401 anonymous, 403 authenticated) |
 
-Reads (`GET`) are public. Writes (`POST`, `PUT`, `PATCH`, `DELETE`) must carry a non-blank `X-User-Id` header,
-which the API Gateway sets after it validates the caller's JWT. A write without it gets **401** with
-`{"error": "Authentication required"}` and is never processed.
+- **Ownership (BOLA):** every merchant-side query is scoped by the JWT `storeId` (`findByPublicIdAndStoreId`,
+  ...), never by request data; another store's ids answer **404**. Customer reviews are scoped by the JWT subject.
+- A merchant whose token says `BANNED` can still read the catalog but not change it (403 `ACCOUNT_BANNED`); a
+  `PENDING_APPROVAL` / `REJECTED` merchant can create drafts but not activate them (403 `MERCHANT_NOT_APPROVED`).
+  A banned customer cannot review.
+- Request and response DTOs only, never entities; server-controlled fields (`status` of new products, `storeId`,
+  ratings, prices after discounts) are never taken from clients. Bean Validation on every DTO; free text (names,
+  descriptions, option values, reviews, replies, reasons) is sanitized with the OWASP HTML sanitizer; LIKE
+  wildcards are escaped; SQL is parameterised only.
+- Every admin, merchant and assistant mutation (categories, products, status changes, stock edits, discounts,
+  review replies and moderation) writes an append-only `audit_log` row (a trigger rejects updates and deletes).
 
-### Gateway bypass guard: what it does and does not protect
+## Catalog model
 
-> **This is not authentication.** `GatewayUserHeaderFilter` only checks that the `X-User-Id` header is
-> present. It does not validate a JWT or a signature, and it does not check the value. Anyone who can reach
-> this service directly can send `X-User-Id: anything` and the write goes through.
-
-The check only stops accidental or naive direct calls, such as a write that someone sends to port 8082
-by mistake instead of through the Gateway. The real protection comes from **network isolation** in
-deployment: only the API Gateway should be able to reach product-service (private network, no published port,
-firewall or security-group rules). The Gateway must also **strip any client-supplied `X-User-Id`** and set
-its own. Otherwise a client can put its own header on a request that goes through the Gateway.
-Until both are in place, do not treat write access to this service as secured.
-
-The guard matches on the HTTP method, not on a list of paths. Every request except `GET`, `HEAD` and
-`OPTIONS` needs the header, so new write endpoints are covered automatically. When you call writes directly
-(curl, Swagger UI), add the header yourself, as in the examples below.
-
-| Method | Path | Description |
+| Entity | Public id | Notes |
 |---|---|---|
-| POST | `/api/categories` | Create a category (201). `name` must be unique (409 otherwise) |
-| GET | `/api/categories` | List all categories, sorted by name |
-| POST | `/api/products` | Create a product (201) with its inventory row set to 0. `sku` must be unique (409), and the category must exist (404) |
-| GET | `/api/products/{id}` | One product, including its category and current stock |
-| PUT | `/api/products/{id}` | Replace the product fields (same body as POST) |
-| DELETE | `/api/products/{id}` | Delete the product and its inventory (204) |
-| GET | `/api/products` | Paginated search, described below |
-| PATCH | `/api/products/{id}/inventory` | Body `{"delta": int}`. Adds `delta` to `quantityAvailable`, or returns **409** if the result would be negative |
+| Category | `slug` | admin CRUD; flat with an optional parent (two levels at most); unique slug and name; only unused categories can be deleted |
+| Product (item) | `ITM-YYMM-XXXXXX` | `storeId` from the JWT; `DRAFT` / `ACTIVE` / `ARCHIVED`; `codAllowed`; rating aggregates; `imageKeys` |
+| Product option | (by name) | e.g. Size: [S, M, L]; up to 5 per product |
+| Variant | `VAR-YYMM-XXXXXX` | merchant SKU **unique per store** (case-insensitive, unique index), attributes (one value per option), `listPrice`, `ACTIVE` / `INACTIVE`, `imageKeys` |
+| Inventory | (per variant) | `quantityAvailable` (sellable), `reservedQuantity` (held), `@Version`, CHECK constraints: never negative |
+| Stock reservation | (per `orderRef` + variant) | `HELD` → `COMMITTED` or `RELEASED` (reason `RELEASED` / `ADJUSTED` / `EXPIRED`), `expiresAt` |
+| Discount | `DSC-YYMM-XXXXXX` | `PRODUCT` or `VARIANT` scope, `PERCENT` (1-90) or `FIXED` (must leave a price > 0), `startsAt` / `endsAt`, `active` |
+| Product review | `REV-YYMM-XXXXXX` | one per order item, rating 1-5, sanitized text, `attachmentKeys` (mock storage); one store reply; admin hide/unhide |
 
-### Search parameters (`GET /api/products`)
+- **The product is one aggregate.** `POST /api/merchant/products` creates it with its options and variants
+  (status `DRAFT`). A simple product sends `sku` + `listPrice` (+ `initialStock`) and gets one default variant.
+  `PUT` replaces the aggregate: listed variants are updated (by `publicId`) or added (with `initialStock`), the
+  others become `INACTIVE` (variants are never deleted: holds, orders and reviews refer to them, and they keep
+  their SKU). Stock is not changed by `PUT`.
+- **Status:** `DRAFT ↔ ACTIVE`, `DRAFT/ACTIVE → ARCHIVED` (`DELETE` archives), `ARCHIVED → DRAFT`. Activation
+  needs an active variant and an approved merchant. Archived products cannot be edited.
+- **Public visibility:** a product is listed and shown only when it is `ACTIVE`, at least one variant is active,
+  and its store is visible: the `store_visibility` cache says `visible` (store-service's
+  `published && acceptingOrders`, from `StoreVisibilityChanged`) and the owner's status (from `UserStatusChanged`)
+  is `ACTIVE` or not reported. A merchant in `BAN_GRACE` or `BANNED` leaves search at once; the merchant's own
+  views do not show visibility, so the silent ban stays silent (D4). A pending merchant's store is never announced,
+  so its drafts are never public.
 
-All parameters are optional, and the filters combine with AND.
+## Prices and discounts
 
-| Param | Example | Meaning |
-|---|---|---|
-| `categoryId` | `categoryId=4a21…` | Only products in this category |
-| `minPrice` / `maxPrice` | `minPrice=10&maxPrice=50` | Inclusive price range (400 if `minPrice > maxPrice`) |
-| `q` | `q=mouse` | Case-insensitive partial match on the name |
-| `sort` | `sort=price,asc` | One of `name`, `price`, `sku`, `createdAt`, `updatedAt`. Repeatable. Default `name,asc` |
-| `page` / `size` | `page=0&size=20` | Zero-based page. `size` defaults to 20 and is capped at 100 |
+Effective price = list price minus the **single best** discount that applies **now** (evaluated at read time, no
+stacking): the discount is `active`, `startsAt <= now < endsAt` (open ends allowed), targets the variant or its
+product, and leaves a price above zero. Percent amounts are rounded half-up to cents. Ties go to the
+variant-specific discount, then the oldest. The same rule is used by the public views, the internal quote and the
+search price filter/sort (`PriceCalculator` in Java, the same arithmetic in `SqlProductSearchEngine`).
 
-Response shape:
+## Stock and reservations
 
-```json
-{ "content": [ { "id": "…", "name": "…", "price": 24.99, "sku": "…",
-                 "category": { "id": "…", "name": "…" },
-                 "stock": { "quantityAvailable": 25, "reservedQuantity": 0 }, "…": "…" } ],
-  "page": 0, "size": 20, "totalElements": 1, "totalPages": 1 }
-```
+- **Merchant stock edit** (`STOCK_EDIT`): `PATCH /api/merchant/variants/{publicId}/stock` with
+  `{"mode":"SET"|"DELTA","quantity":n,"reason":"...","expectedVersion":v?}` changes the available quantity (held
+  units untouched), never below zero (409 `INSUFFICIENT_STOCK`), with `@Version` optimistic locking (409
+  `CONCURRENT_MODIFICATION` on a stale `expectedVersion` or a concurrent change) and an audit row with the reason.
+  The old user-callable `PATCH /api/products/{id}/inventory` is removed.
+- **Reservations** (order-service only, `ROLE_SERVICE`), all idempotent per `orderRef` and serialised per order by a
+  transaction-scoped PostgreSQL advisory lock:
+  - `POST /internal/reservations`: all lines or none. Each line is one conditional update
+    (`... where quantity_available >= :qty`), so concurrent orders never oversell; variants are locked in a fixed
+    order (no deadlocks). Lines must be active variants of `ACTIVE` products of one visible store (409
+    `VARIANT_NOT_AVAILABLE`). A replay with the same lines answers 200 with the existing hold; different lines answer
+    409 `RESERVATION_CONFLICT`.
+  - `PUT /internal/reservations/{orderRef}` (quote): the lines to keep; quantities may only go down (400
+    `RESERVATION_ADJUST_NOT_ALLOWED` otherwise); left-out or 0 lines are released (`ADJUSTED`); optional new
+    `expiresAt`.
+  - `POST .../commit`: held units leave the stock for good (idempotent). `POST .../release`: held units return to
+    available (idempotent; 409 `RESERVATION_COMMITTED` after a commit).
+  - Safety net: `ReservationCleanupJob` (every 5 min, ShedLock) releases holds still `HELD` one hour after their
+    `expiresAt` (reason `EXPIRED`) and alerts admins through `NotificationPort`. order-service stays authoritative.
 
-Errors other than the 401 above always use the same JSON shape (400 validation, 404 not found, 409 conflict / insufficient stock):
+## Search
 
-```json
-{
-  "timestamp": "2026-09-29T05:26:32.670Z",
-  "status": 409,
-  "error": "Conflict",
-  "message": "Insufficient stock for product d1b4…: available 25, requested change -30",
-  "path": "/api/products/d1b4…/inventory"
-}
-```
+`GET /api/public/products` goes through the `ProductSearchEngine` interface; the current implementation
+(`SqlProductSearchEngine`, `app.search.engine=sql`) is plain PostgreSQL: a case-insensitive match on the name
+(wildcards escaped; trigram GIN index on `lower(name)`), relevance = prefix match, then trigram similarity, then
+newest. A real search engine can replace it (e.g. fed by `product-events`) without touching the API.
 
-Validation errors also include `"fieldErrors": [{ "field": "price", "message": "…" }]`.
+| Param | Meaning |
+|---|---|
+| `q` | name contains (case-insensitive) |
+| `category` | category slug, its sub-categories included (unknown: empty result) |
+| `store` | store public id `STR-...` (unknown: empty result) |
+| `minPrice` / `maxPrice` | on the effective "from" price (cheapest active variant after its discount); 400 if min > max |
+| `inStock` | at least one active variant has stock available |
+| `minRating` | average rating at least |
+| `sort` | `relevance` (default), `price` / `price,asc`, `price,desc`, `newest`, `rating` (anything else: 400 `INVALID_SORT`) |
+| `page` / `size` | max size 50 |
 
-### Example curl session
+Public responses carry public ids only, no SKUs and no stock counts: `inStock` / `lowStock` flags only.
 
-```bash
-# Writes need the header the Gateway would set (see "Gateway bypass guard" above)
-AUTH=(-H 'X-User-Id: local-dev')
+## Reviews
 
-# Without it, writes are rejected -> 401 {"error":"Authentication required"}
-curl -i -X POST http://localhost:8082/api/categories -H 'Content-Type: application/json' -d '{"name":"X"}'
+- `OrderCompleted` (order-events) records `review_eligibility`, one row per (order, variant), idempotently.
+- `POST /api/customer/products/{publicId}/reviews` with `{orderPublicId, variantPublicId?, rating, text,
+  attachmentKeys}`: only for an item of the caller's completed order (404 `REVIEW_NOT_ELIGIBLE`), once per order
+  item (409 `REVIEW_ALREADY_EXISTS`). The product's `ratingAvg` / `ratingCount` count visible reviews.
+- One store reply per review (`REVIEW_REPLY`, 409 `REPLY_ALREADY_EXISTS`); admins hide / unhide with a reason (the
+  rating is recomputed).
 
-# Create a category -> 201
-CATEGORY_ID=$(curl -s -X POST http://localhost:8082/api/categories "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Electronics","description":"Gadgets and devices"}' | jq -r .id)
+## Endpoints
 
-# Create a product -> 201, stock starts at 0
-PRODUCT_ID=$(curl -s -X POST http://localhost:8082/api/products "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\":\"Wireless Mouse\",\"description\":\"2.4GHz, USB-C\",\"price\":24.99,
-       \"sku\":\"MOUSE-001\",\"categoryId\":\"$CATEGORY_ID\"}" | jq -r .id)
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| GET | `/api/public/categories` | anyone | active categories |
+| GET | `/api/public/products` | anyone | search (above) |
+| GET | `/api/public/products/{publicId}` | anyone | visible product, active variants, effective prices, discount, availability |
+| GET | `/api/public/products/{publicId}/reviews` | anyone | visible reviews with replies (sort `createdAt`, `rating`) |
+| GET | `/api/merchant/products` | merchant; assistant `PRODUCT_EDIT`/`STOCK_EDIT`/`DISCOUNT_MANAGE` | own store, `status`, `q`, sort `createdAt`/`updatedAt`/`name` |
+| GET | `/api/merchant/products/{publicId}` | same | aggregate with stock and current prices |
+| POST | `/api/merchant/products` | merchant; assistant `PRODUCT_EDIT` | create (DRAFT) |
+| PUT | `/api/merchant/products/{publicId}` | same | replace the aggregate |
+| POST | `/api/merchant/products/{publicId}/status` | same | `{"status":"DRAFT"\|"ACTIVE"\|"ARCHIVED"}` |
+| DELETE | `/api/merchant/products/{publicId}` | same | archive |
+| PATCH | `/api/merchant/variants/{publicId}/stock` | merchant; assistant `STOCK_EDIT` | SET / DELTA with reason |
+| GET, POST | `/api/merchant/discounts` | merchant; assistant `DISCOUNT_MANAGE` | list (`product=ITM-...`), create |
+| GET, PUT, DELETE | `/api/merchant/discounts/{publicId}` | same | |
+| GET | `/api/merchant/products/reviews` | merchant; assistant `REVIEW_REPLY` | the store's reviews (`product=ITM-...`) |
+| POST | `/api/merchant/products/reviews/{reviewPublicId}/reply` | same | one reply |
+| POST | `/api/customer/products/{publicId}/reviews` | customer | review a completed order item |
+| GET, POST | `/api/admin/categories` | admin, super admin | list all, create |
+| GET, PUT, DELETE | `/api/admin/categories/{slug}` | same | |
+| GET | `/api/admin/products?store=STR-...` | same | a store's products for moderation (max size 100) |
+| GET | `/api/admin/products/{publicId}` | same | any product |
+| GET | `/api/admin/reviews?product=ITM-...` | same | all reviews of a product |
+| POST | `/api/admin/reviews/{reviewPublicId}/hide`, `/unhide` | same | `{"reason":"..."}` |
+| POST | `/internal/variants/quote` | `ROLE_SERVICE` | `{variantIds[], variantPublicIds[]}` → per variant: storeId/publicId/name, product and variant names, SKU, attributes, `listPrice`, `discountAmount`, `unitPrice`, `discountPublicId`, `availableQuantity`, `codAllowed`, `productActive`, `variantActive`, `storeVisible`, `purchasable`; plus `missing[]` |
+| POST | `/internal/reservations` | `ROLE_SERVICE` | `{orderRef, expiresAt, lines:[{variantId\|variantPublicId, quantity}]}`; 201 new, 200 replay |
+| GET, PUT | `/internal/reservations/{orderRef}` | `ROLE_SERVICE` | read; adjust (reduce only) |
+| POST | `/internal/reservations/{orderRef}/commit`, `/release` | `ROLE_SERVICE` | |
 
-# Get one product (with category and stock)
-curl -s http://localhost:8082/api/products/$PRODUCT_ID
+Errors keep the JSON shape `{timestamp, status, error, code, message, path, fieldErrors}`; `code` is stable
+(`ErrorCode`), e.g. `VALIDATION_FAILED`, `NOT_FOUND`, `TOKEN_REVOKED`, `SKU_TAKEN`, `INVALID_VARIANTS`,
+`INVALID_STATUS_TRANSITION`, `PRODUCT_NOT_SELLABLE`, `INSUFFICIENT_STOCK`, `VARIANT_NOT_AVAILABLE`,
+`RESERVATION_CONFLICT`, `RESERVATION_ADJUST_NOT_ALLOWED`, `RESERVATION_COMMITTED`, `RESERVATION_RELEASED`,
+`INVALID_DISCOUNT`, `REVIEW_NOT_ELIGIBLE`, `REVIEW_ALREADY_EXISTS`, `REPLY_ALREADY_EXISTS`, `CATEGORY_IN_USE`.
 
-# List with filters: category + price range + name search, cheapest first
-curl -s "http://localhost:8082/api/products?categoryId=$CATEGORY_ID&minPrice=10&maxPrice=50&q=mouse&sort=price,asc&page=0&size=20"
+## Events
 
-# Adjust inventory: restock 25 -> {"productId":"…","quantityAvailable":25,"reservedQuantity":0}
-curl -s -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory "${AUTH[@]}" \
-  -H 'Content-Type: application/json' -d '{"delta":25}'
+- **Published** (outbox written in the same transaction, relayed by `OutboxRelay` every second, at-least-once,
+  keyed by the product UUID): topic `product-events`, `ProductChanged` with `eventId`, `eventType`, `occurredAt`,
+  `productId`, `productPublicId`, `storeId`, `name`, `status`, `previousStatus`, `categorySlug`, `codAllowed`,
+  `variants[{variantId, variantPublicId, sku, listPrice, status}]`, `change` (`CREATED`, `UPDATED`,
+  `STATUS_CHANGED`). No stock counts.
+- **Consumed** (group `product-service`; idempotent through `processed_events`; failures retried with back-off,
+  unreadable messages skipped):
+  - `user-events`: `UserSecurityChanged` / `UserStatusChanged` → security-state cache; a merchant's
+    `UserStatusChanged` → owner status in `store_visibility`.
+  - `store-events`: `StoreVisibilityChanged` → `store_visibility` (store public id, name, visible, COD); a late
+    event never overwrites a newer one.
+  - `order-events`: `OrderCompleted` (`orderId`, `orderPublicId`, `customerId`, `lines[{variantId|variantPublicId}]`)
+    → review eligibility.
 
-# Take 30 out -> 409 Conflict, quantity stays 25
-curl -i -X PATCH http://localhost:8082/api/products/$PRODUCT_ID/inventory "${AUTH[@]}" \
-  -H 'Content-Type: application/json' -d '{"delta":-30}'
-```
+## Mock ports
 
-## Design notes
-
-- **Inventory is its own table** (`inventory`, one-to-one with `products`). Stock changes much more often
-  than product details, so keeping it separate isolates that write traffic and its row locks from catalog reads
-  and edits.
-- **Concurrent stock updates are safe.** `PATCH …/inventory` locks the inventory row
-  (`SELECT … FOR UPDATE`) before checking and applying the delta. Two orders racing for the last item are
-  therefore handled one after the other: one succeeds and the other gets a 409.
-- **Search** is built with Spring Data JPA Specifications (`ProductSpecifications`). Each filter that is present
-  adds one predicate, so every combination works without a query written for it. LIKE wildcards in `q` are
-  escaped. Each page loads its categories in the same query (entity graph) and its stock with one extra query.
-- **Indexes:** `idx_products_category_id` (category filter) and a unique `idx_products_sku` (SKU lookups and
-  uniqueness), declared with `@Table(indexes = …)`.
+`ImageStoragePort` (`MockImageStorageAdapter`: every key exists, URL = `app.ports.image-base-url` + key) and
+`NotificationPort` (`MockNotificationAdapter`: logs store and admin notifications such as a new review, low stock or
+safety-net releases), selected with `@ConditionalOnProperty` so real providers can be plugged in later.
 
 ## Tests
 
 ```bash
-mvn clean package
+mvn clean verify
 ```
 
-- `ProductSpecificationsTest`: which predicates each filter combination builds (mocked Criteria API),
-  that blank or absent filters add no restriction, and LIKE escaping
-- `ProductServiceTest`: rejects `minPrice > maxPrice` and unknown sort fields, and adds a stable sort tie-breaker
-- `InventoryTest`: the negative-quantity guard (a rejected change leaves stock untouched), overflow, and the
-  service's 404 path
-- `GatewayUserHeaderFilterTest`: each write endpoint returns 401 with the JSON error and never reaches its
-  handler when `X-User-Id` is missing or blank, reaches the handler when the header is present, and the GET
-  endpoints work with or without the header (`@WebMvcTest` with mocked services, no database)
-- `ProductFlowIntegrationTest`: runs against a real PostgreSQL through Testcontainers (Docker required).
-  It covers create product → list with a category filter (plus combined filters, sorting and paging) →
-  adjust inventory → verify quantity, a 409 on negative stock, update and delete, and the 400/404/409 error bodies.
+Integration tests run the full application against PostgreSQL (Testcontainers), an embedded Kafka broker and a
+WireMock user-service (JWKS); Docker is required.
+
+- `AuthorizationMatrixTest`: every endpoint × anonymous, customer, merchant, assistant with and without the
+  permission, admin, super admin and service (401/403/404/2xx), including deny-by-default and the removed paths.
+- `OwnershipTest`: merchant A vs B (404 everywhere), assistants and route permissions, customers/admins on merchant
+  routes, revoked tokens, banned and pending merchants, and that no handler is mapped to the old
+  `/api/products/{id}/inventory`.
+- `InventoryTest`: idempotent / all-or-nothing reserve, adjust only reduces, commit / release idempotency and
+  exclusivity, the safety net, merchant stock edits with audit and optimistic locking.
+- `ReservationConcurrencyTest`: 40 parallel buyers for 10 units → exactly 10 holds; parallel replays of one order
+  hold once; parallel commit/release of one order apply only one.
+- `SearchVisibilityTest`: draft, archived, hidden store, `BAN_GRACE` and banned owners, pending merchants, products
+  without active variants are not listed; effective-price filter and sort, stock, rating, store, category with
+  sub-categories, relevance and escaped text search, availability flags, no SKUs or counts in public views.
+- `PriceCalculatorTest` / `DiscountApiTest`: windows, percent/fixed, best wins, no stacking, validation, prices in
+  public views and the internal quote over time.
+- `ProductServiceTest`: default variants, option/variant validation, SKU uniqueness per store, update semantics,
+  status lifecycle, `ProductChanged` outbox rows and audit rows, merchant list paging.
+- `EventConsumerTest` / `ProductFlowIntegrationTest`: consumer idempotency and ordering; the whole life of a product
+  across Kafka (store visibility, quote, reserve, commit, `OrderCompleted`, review, reply, moderation, silent ban,
+  `ProductChanged` relayed to `product-events`).
+- `ProductSpecificationsTest`, `OpenApiDocsTest`: escaping, sort parsing, public ids, sanitising; API docs list the
+  public routes and no internal ones.

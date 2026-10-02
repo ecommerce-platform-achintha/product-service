@@ -1,9 +1,11 @@
 package com.achintha.productservice.exception;
 
-/** A request that clashes with existing data, e.g. a duplicate SKU or category name. */
-public class ConflictException extends RuntimeException {
+import org.springframework.http.HttpStatus;
 
-    public ConflictException(String message) {
-        super(message);
+/** 409: a request that clashes with existing data or state, e.g. a duplicate SKU or category slug. */
+public class ConflictException extends ApiException {
+
+    public ConflictException(ErrorCode code, String message) {
+        super(HttpStatus.CONFLICT, code, message);
     }
 }
