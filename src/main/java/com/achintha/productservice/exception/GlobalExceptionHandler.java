@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.TypeMismatchException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
@@ -17,6 +18,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /** Maps every error to the {@link ApiError} JSON shape, always with a stable {@link ErrorCode}. */
@@ -46,6 +48,17 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiError> handleUnreadable(HttpMessageNotReadableException ex, HttpServletRequest request) {
         return build(HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST, "Malformed request body", request,
                 List.of());
+    }
+
+    /** Unparseable path/query parameters, e.g. a non-UUID id or a non-numeric page. */
+    @ExceptionHandler(TypeMismatchException.class)
+    ResponseEntity<ApiError> handleTypeMismatch(TypeMismatchException ex, HttpServletRequest request) {
+        // MethodArgumentTypeMismatchException (controller parameters) keeps the name in getName(), not getPropertyName()
+        String name = ex instanceof MethodArgumentTypeMismatchException methodEx
+                ? methodEx.getName()
+                : ex.getPropertyName();
+        return build(HttpStatus.BAD_REQUEST, ErrorCode.BAD_REQUEST,
+                "Invalid value for '" + (name != null ? name : "parameter") + "'", request, List.of());
     }
 
     @ExceptionHandler(ApiException.class)
