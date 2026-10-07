@@ -20,6 +20,7 @@ public enum ErrorCode {
     TOKEN_REVOKED,
     ACCOUNT_BANNED,
     MERCHANT_NOT_APPROVED,
+    PASSWORD_CHANGE_REQUIRED,
 
     // Categories
     CATEGORY_SLUG_TAKEN,
